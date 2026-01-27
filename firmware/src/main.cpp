@@ -33,13 +33,9 @@ unsigned long lastFirebaseSend = 0;
 // ========== GLOBAL RUNTIME VARIABLES ==========
 
 // Primary Control Parameters
-float targetLevelPercent = 50.0f;           // Valve Target (PID)
-float pumpStopLevel = DEFAULT_SETPOINT;     // Upper Cut-off (Pump)
-float pumpStartLevel = DEFAULT_LOWER_LIMIT; // Lower Turn-on (Pump)
-
-// Legacy compatibility (Ensures dashboard v0.4.0 and earlier don't break)
-float setpointPercent = DEFAULT_SETPOINT;
-float lowerLimitPercent = DEFAULT_LOWER_LIMIT;
+float targetLevelPercent = DEFAULT_SETPOINT;
+float pumpStopLevel = DEFAULT_SETPOINT;
+float pumpStartLevel = DEFAULT_LOWER_LIMIT;
 
 // Transient State
 bool pumpOn = false;
@@ -56,7 +52,8 @@ float maxDistanceCm = MAX_DISTANCE_CM;
 float currentKp = PID_KP;
 float currentKi = PID_KI;
 float currentKd = PID_KD;
-PIDController pid(PID_KP, PID_KI, PID_KD);
+// Initialize PID with 0-100% output limits
+PIDController pid(PID_KP, PID_KI, PID_KD, 0.0f, 100.0f);
 
 // DAC Output Settings (8-bit: 0-255)
 int currentDacMin = DAC_MIN_VAL;
@@ -123,6 +120,42 @@ float clampValue(float x, float minVal, float maxVal)
     if (x < minVal) return minVal;
     if (x > maxVal) return maxVal;
     return x;
+}
+
+// Helper to unify parameter updates
+void updateTargetSetpoint(float v) {
+    v = clampValue(v, 0.0f, 100.0f);
+    if (abs(targetLevelPercent - v) > 0.1f) {
+        targetLevelPercent = v;
+        preferences.putFloat("targetSetpoint", v);
+        logSystem("Target Setpoint Updated: " + String(v, 1));
+    }
+}
+
+void updatePumpStartLevel(float v) {
+    v = clampValue(v, 0.0f, 100.0f);
+    if (abs(pumpStartLevel - v) > 0.1f) {
+        pumpStartLevel = v;
+        preferences.putFloat("startLevel", v);
+        logSystem("Pump Start Level Updated: " + String(v, 1));
+    }
+}
+
+void updatePumpStopLevel(float v) {
+    v = clampValue(v, 0.0f, 100.0f);
+    if (abs(pumpStopLevel - v) > 0.1f) {
+        pumpStopLevel = v;
+        preferences.putFloat("stopLevel", v);
+        logSystem("Pump Stop Level Updated: " + String(v, 1));
+    }
+}
+
+void updateTankHeight(float v) {
+    if (v > 0 && abs(tankHeightCm - v) > 0.1f) {
+        tankHeightCm = v;
+        preferences.putFloat("tankHeight", v);
+        logSystem("Tank Height Updated: " + String(v, 1));
+    }
 }
 
 void sendJson(WebServer &srv, JsonDocument &doc, int statusCode = 200)
@@ -198,7 +231,12 @@ void setPump(bool on)
 
 void updateAnalogOutput(float pidOutputPercent)
 {
-    int dacValue = (int)map((long)pidOutputPercent, 0, 100, currentDacMin, currentDacMax);
+    // Map 0-100% to DAC_MIN (0.66V) - DAC_MAX (3.3V)
+    // Using float math for better precision before casting
+    float range = (float)(currentDacMax - currentDacMin);
+    float val = (float)currentDacMin + (pidOutputPercent / 100.0f) * range;
+
+    int dacValue = (int)val;
     dacValue = constrain(dacValue, currentDacMin, currentDacMax);
     dacWrite(ANALOG_OUTPUT_PIN, dacValue);
 }
@@ -229,28 +267,16 @@ class MyControlCallbacks : public BLECharacteristicCallbacks
             StaticJsonDocument<512> packet;
             if (deserializeJson(packet, incoming)) return;
 
-            if (packet.containsKey("target_setpoint"))
-            {
-                targetLevelPercent = clampValue(packet["target_setpoint"], 0.0f, 100.0f);
-                setpointPercent = targetLevelPercent;
-                preferences.putFloat("targetSetpoint", targetLevelPercent);
-            }
-            if (packet.containsKey("stop_level"))
-            {
-                pumpStopLevel = clampValue(packet["stop_level"], 0.0f, 100.0f);
-                preferences.putFloat("stopLevel", pumpStopLevel);
-            }
-            if (packet.containsKey("start_level"))
-            {
-                pumpStartLevel = clampValue(packet["start_level"], 0.0f, 100.0f);
-                lowerLimitPercent = pumpStartLevel;
-                preferences.putFloat("startLevel", pumpStartLevel);
-            }
-            if (packet.containsKey("tank_height_cm"))
-            {
-                tankHeightCm = packet["tank_height_cm"];
-                preferences.putFloat("tankHeight", tankHeightCm);
-            }
+            if (packet.containsKey("target_setpoint")) updateTargetSetpoint(packet["target_setpoint"]);
+            if (packet.containsKey("setpoint")) updateTargetSetpoint(packet["setpoint"]); // Legacy alias
+
+            if (packet.containsKey("stop_level")) updatePumpStopLevel(packet["stop_level"]);
+
+            if (packet.containsKey("start_level")) updatePumpStartLevel(packet["start_level"]);
+            if (packet.containsKey("lower_limit")) updatePumpStartLevel(packet["lower_limit"]); // Legacy alias
+
+            if (packet.containsKey("tank_height_cm")) updateTankHeight(packet["tank_height_cm"]);
+
             logSystem("BLE Local Config Applied");
         }
     }
@@ -290,7 +316,7 @@ void handleStatus()
     status["rssi"] = WiFi.RSSI();
     status["uptime"] = millis() / 1000;
 
-    // Aliases
+    // Aliases for compatibility
     status["setpoint_percent"] = targetLevelPercent;
     status["lower_limit"] = pumpStartLevel;
 
@@ -308,6 +334,10 @@ void handleConfig()
         cfg["target_setpoint"] = targetLevelPercent;
         cfg["start_level"] = pumpStartLevel;
         cfg["stop_level"] = pumpStopLevel;
+        // Aliases
+        cfg["setpoint"] = targetLevelPercent;
+        cfg["lower_limit"] = pumpStartLevel;
+
         cfg["kp"] = currentKp;
         cfg["ki"] = currentKi;
         cfg["kd"] = currentKd;
@@ -319,23 +349,15 @@ void handleConfig()
         StaticJsonDocument<512> update;
         deserializeJson(update, server.arg("plain"));
 
-        if (update.containsKey("target_setpoint"))
-        {
-            targetLevelPercent = clampValue(update["target_setpoint"], 0.0f, 100.0f);
-            setpointPercent = targetLevelPercent;
-            preferences.putFloat("targetSetpoint", targetLevelPercent);
-        }
-        if (update.containsKey("start_level"))
-        {
-            pumpStartLevel = clampValue(update["start_level"], 0.0f, 100.0f);
-            lowerLimitPercent = pumpStartLevel;
-            preferences.putFloat("startLevel", pumpStartLevel);
-        }
-        if (update.containsKey("stop_level"))
-        {
-            pumpStopLevel = clampValue(update["stop_level"], 0.0f, 100.0f);
-            preferences.putFloat("stopLevel", pumpStopLevel);
-        }
+        if (update.containsKey("target_setpoint")) updateTargetSetpoint(update["target_setpoint"]);
+        if (update.containsKey("setpoint")) updateTargetSetpoint(update["setpoint"]);
+
+        if (update.containsKey("start_level")) updatePumpStartLevel(update["start_level"]);
+        if (update.containsKey("lower_limit")) updatePumpStartLevel(update["lower_limit"]);
+
+        if (update.containsKey("stop_level")) updatePumpStopLevel(update["stop_level"]);
+
+        if (update.containsKey("tank_height_cm")) updateTankHeight(update["tank_height_cm"]);
 
         StaticJsonDocument<64> ack;
         ack["status"] = "OK";
@@ -348,12 +370,10 @@ void handlePidUpdate()
     if (!server.hasArg("plain")) return;
     StaticJsonDocument<256> pidDoc;
     deserializeJson(pidDoc, server.arg("plain"));
-    if (pidDoc.containsKey("setpoint"))
-    {
-        targetLevelPercent = clampValue(pidDoc["setpoint"], 0.0f, 100.0f);
-        setpointPercent = targetLevelPercent;
-        preferences.putFloat("targetSetpoint", targetLevelPercent);
-    }
+
+    if (pidDoc.containsKey("setpoint")) updateTargetSetpoint(pidDoc["setpoint"]);
+    if (pidDoc.containsKey("lower_limit")) updatePumpStartLevel(pidDoc["lower_limit"]);
+
     StaticJsonDocument<64> ok;
     ok["status"] = "PID Sync Done";
     sendJson(server, ok);
@@ -404,9 +424,6 @@ void setup()
     pumpStartLevel = preferences.getFloat("startLevel", DEFAULT_LOWER_LIMIT);
     targetLevelPercent = preferences.getFloat("targetSetpoint", 50.0f);
 
-    setpointPercent = targetLevelPercent;
-    lowerLimitPercent = pumpStartLevel;
-
     currentKp = preferences.getFloat("kp", PID_KP);
     currentKi = preferences.getFloat("ki", PID_KI);
     currentKd = preferences.getFloat("kd", PID_KD);
@@ -414,6 +431,7 @@ void setup()
     currentDacMax = preferences.getInt("dacMax", DAC_MAX_VAL);
 
     pid.setTunings(currentKp, currentKi, currentKd);
+    pid.setOutputLimits(0.0f, 100.0f);
 
     // 2. Hardware Mapping
     pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
@@ -422,7 +440,7 @@ void setup()
     pinMode(0, INPUT_PULLUP);
 
     setPump(false);
-    dacWrite(ANALOG_OUTPUT_PIN, currentDacMin);
+    dacWrite(ANALOG_OUTPUT_PIN, 0); // Start at 0V
 
     // 3. WiFi Connectivity
     wm.setSaveConfigCallback(saveConfigCallback);
@@ -447,14 +465,16 @@ void setup()
 
     if (shouldSaveConfig)
     {
-        tankHeightCm = atof(custom_h.getValue());
-        maxDistanceCm = atof(custom_m.getValue());
-        targetLevelPercent = atof(custom_t.getValue());
-        setpointPercent = targetLevelPercent;
+        float h = atof(custom_h.getValue());
+        float m = atof(custom_m.getValue());
+        float t = atof(custom_t.getValue());
 
-        preferences.putFloat("tankHeight", tankHeightCm);
-        preferences.putFloat("maxDist", maxDistanceCm);
-        preferences.putFloat("targetSetpoint", targetLevelPercent);
+        updateTankHeight(h);
+        if (abs(maxDistanceCm - m) > 0.1f) {
+            maxDistanceCm = m;
+            preferences.putFloat("maxDist", m);
+        }
+        updateTargetSetpoint(t);
     }
 
     // 4. External Services
@@ -533,16 +553,23 @@ void loop()
         float currentLevel = readLevelPercent();
         if (currentLevel < 0)
         {
-            if (pumpOn)
-                setPump(false);
+            // Sensor Error - Fail Safe
+            if (pumpOn) setPump(false);
             lastLevelPercent = -1.0f;
-            updateAnalogOutput(0.0f);
+
+            // Output 0V for safety
+            dacWrite(ANALOG_OUTPUT_PIN, 0);
+            lastPidOutput = 0.0f;
         }
         else
         {
             lastLevelPercent = currentLevel;
 
             // 1. Pump Deadband Logic
+            // "when the desired setpoint is reached, the control voltage drops to zero
+            // and the pump sends a 0.0v signal to cut off the pump"
+            // Interpreting 'setpoint reached' as reaching the Pump Stop Level.
+
             if (currentLevel >= pumpStopLevel && pumpOn)
             {
                 setPump(false);
@@ -552,10 +579,26 @@ void loop()
                 setPump(true);
             }
 
-            // 2. Valve PID Logic
-            float dt = CONTROL_INTERVAL_MS / 1000.0f;
-            lastPidOutput = clampValue(pid.compute(targetLevelPercent, currentLevel, dt), 0.0f, 100.0f);
-            updateAnalogOutput(lastPidOutput);
+            // 2. Valve / Actuator Logic
+            // "control voltage drops to zero" when setpoint reached (pump off)
+            // "maintain the pumps off state until the lower dead band is reached"
+            // During this OFF state, we ensure Actuator is 0V.
+
+            if (!pumpOn)
+            {
+                // Force 0V (absolute zero, not 0.66V minimum)
+                dacWrite(ANALOG_OUTPUT_PIN, 0);
+                lastPidOutput = 0.0f;
+                // Optionally reset PID integral to avoid windup during off-time
+                pid.reset();
+            }
+            else
+            {
+                // Normal Operation: PID Control (0.66V - 3.3V)
+                float dt = CONTROL_INTERVAL_MS / 1000.0f;
+                lastPidOutput = clampValue(pid.compute(targetLevelPercent, currentLevel, dt), 0.0f, 100.0f);
+                updateAnalogOutput(lastPidOutput);
+            }
         }
 
         // 3. Cloud Integration (500ms Pulse - JSON BATCHING OPTIMIZED)
@@ -588,44 +631,38 @@ void loop()
 
                 // Control Pulls
                 if (json.get(data, "control/target_setpoint") && data.typeNum == FirebaseJson::JSON_FLOAT)
-                {
-                    float v = data.floatValue;
-                    if (abs(v - targetLevelPercent) > 0.1) { targetLevelPercent = v; setpointPercent = v; preferences.putFloat("targetSetpoint", v); }
-                }
+                    updateTargetSetpoint(data.floatValue);
+
                 if (json.get(data, "control/stop_level") && data.typeNum == FirebaseJson::JSON_FLOAT)
-                {
-                    float v = data.floatValue;
-                    if (abs(v - pumpStopLevel) > 0.1) { pumpStopLevel = v; preferences.putFloat("stopLevel", v); }
-                }
+                    updatePumpStopLevel(data.floatValue);
+
                 if (json.get(data, "control/start_level") && data.typeNum == FirebaseJson::JSON_FLOAT)
-                {
-                    float v = data.floatValue;
-                    if (abs(v - pumpStartLevel) > 0.1) { pumpStartLevel = v; lowerLimitPercent = v; preferences.putFloat("startLevel", v); }
-                }
+                    updatePumpStartLevel(data.floatValue);
 
                 // Config Profile Pulls
                 if (json.get(data, "config/tank_height") && data.typeNum == FirebaseJson::JSON_FLOAT)
-                {
-                    float v = data.floatValue;
-                    if (abs(v - tankHeightCm) > 0.1) { tankHeightCm = v; preferences.putFloat("tankHeight", v); }
-                }
+                    updateTankHeight(data.floatValue);
 
                 // PID & DAC Tuning Pulls
+                bool tuningsChanged = false;
                 if (json.get(data, "config/pid/kp") && data.typeNum == FirebaseJson::JSON_FLOAT)
                 {
                     float v = data.floatValue;
-                    if (abs(v - currentKp) > 0.001) { currentKp = v; preferences.putFloat("kp", v); pid.setTunings(currentKp, currentKi, currentKd); logSystem("Kp Sync"); }
+                    if (abs(v - currentKp) > 0.001) { currentKp = v; preferences.putFloat("kp", v); tuningsChanged = true; logSystem("Kp Sync"); }
                 }
                 if (json.get(data, "config/pid/ki") && data.typeNum == FirebaseJson::JSON_FLOAT)
                 {
                     float v = data.floatValue;
-                    if (abs(v - currentKi) > 0.001) { currentKi = v; preferences.putFloat("ki", v); pid.setTunings(currentKp, currentKi, currentKd); logSystem("Ki Sync"); }
+                    if (abs(v - currentKi) > 0.001) { currentKi = v; preferences.putFloat("ki", v); tuningsChanged = true; logSystem("Ki Sync"); }
                 }
                 if (json.get(data, "config/pid/kd") && data.typeNum == FirebaseJson::JSON_FLOAT)
                 {
                     float v = data.floatValue;
-                    if (abs(v - currentKd) > 0.001) { currentKd = v; preferences.putFloat("kd", v); pid.setTunings(currentKp, currentKi, currentKd); logSystem("Kd Sync"); }
+                    if (abs(v - currentKd) > 0.001) { currentKd = v; preferences.putFloat("kd", v); tuningsChanged = true; logSystem("Kd Sync"); }
                 }
+
+                if (tuningsChanged) pid.setTunings(currentKp, currentKi, currentKd);
+
                 if (json.get(data, "config/dac/min_volt") && data.typeNum == FirebaseJson::JSON_FLOAT)
                 {
                     float v = data.floatValue;
