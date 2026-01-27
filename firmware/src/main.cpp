@@ -6,10 +6,6 @@
 #include <WebServer.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
 #include <LittleFS.h>
 #include <vector>
 #include <algorithm>
@@ -88,12 +84,6 @@ void saveConfigCallback()
     Serial.println("[WM] Config save triggered");
     shouldSaveConfig = true;
 }
-
-// BLE (Bluetooth) Context
-BLEServer *pServer = NULL;
-BLECharacteristic *pStatusCharacteristic = NULL;
-BLECharacteristic *pControlCharacteristic = NULL;
-bool deviceConnected = false;
 
 // ---------- ANALYTICS & DIAGNOSTICS ----------
 
@@ -240,47 +230,6 @@ void updateAnalogOutput(float pidOutputPercent)
     dacValue = constrain(dacValue, currentDacMin, currentDacMax);
     dacWrite(ANALOG_OUTPUT_PIN, dacValue);
 }
-
-// ---------- BLE INTERFACE CALLBACKS ----------
-
-class MyServerCallbacks : public BLEServerCallbacks
-{
-    void onConnect(BLEServer *pServer)
-    {
-        deviceConnected = true;
-        Serial.println("[BLE] Client Linked");
-    };
-    void onDisconnect(BLEServer *pServer)
-    {
-        deviceConnected = false;
-        Serial.println("[BLE] Client Unlinked");
-    }
-};
-
-class MyControlCallbacks : public BLECharacteristicCallbacks
-{
-    void onWrite(BLECharacteristic *pCharacteristic)
-    {
-        String incoming = pCharacteristic->getValue().c_str();
-        if (incoming.length() > 0)
-        {
-            StaticJsonDocument<512> packet;
-            if (deserializeJson(packet, incoming)) return;
-
-            if (packet.containsKey("target_setpoint")) updateTargetSetpoint(packet["target_setpoint"]);
-            if (packet.containsKey("setpoint")) updateTargetSetpoint(packet["setpoint"]); // Legacy alias
-
-            if (packet.containsKey("stop_level")) updatePumpStopLevel(packet["stop_level"]);
-
-            if (packet.containsKey("start_level")) updatePumpStartLevel(packet["start_level"]);
-            if (packet.containsKey("lower_limit")) updatePumpStartLevel(packet["lower_limit"]); // Legacy alias
-
-            if (packet.containsKey("tank_height_cm")) updateTankHeight(packet["tank_height_cm"]);
-
-            logSystem("BLE Local Config Applied");
-        }
-    }
-};
 
 // ---------- HTTP INTERFACE HANDLERS ----------
 
@@ -457,11 +406,21 @@ void setup()
     wm.addParameter(&custom_m);
     wm.addParameter(&custom_t);
 
+    // Explicitly set AP-STA mode to ensure AP remains active after connection
+    WiFi.mode(WIFI_AP_STA);
+
     if (!wm.autoConnect("TankLogic-Setup", "tank1234"))
     {
         Serial.println("[WIFI] Critical Fail. Restarting.");
         ESP.restart();
     }
+
+    // Force AP to stay on with defined credentials
+    WiFi.softAP(AP_SSID, AP_PASSWORD);
+    Serial.print("[WIFI] AP Started: ");
+    Serial.println(WiFi.softAPIP());
+    Serial.print("[WIFI] STA Connected: ");
+    Serial.println(WiFi.localIP());
 
     if (shouldSaveConfig)
     {
@@ -484,24 +443,6 @@ void setup()
         signupOK = true;
     Firebase.begin(&config, &auth);
     Firebase.reconnectWiFi(true);
-
-    BLEDevice::init("Tank Logic Pro");
-    pServer = BLEDevice::createServer();
-    pServer->setCallbacks(new MyServerCallbacks());
-    BLEService *pService = pServer->createService(BLE_SERVICE_UUID);
-
-    pStatusCharacteristic = pService->createCharacteristic(
-        BLE_CHARACTERISTIC_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_INDICATE);
-    pStatusCharacteristic->addDescriptor(new BLE2902());
-
-    pControlCharacteristic = pService->createCharacteristic(
-        BLE_CONTROL_UUID,
-        BLECharacteristic::PROPERTY_WRITE);
-    pControlCharacteristic->setCallbacks(new MyControlCallbacks());
-
-    pService->start();
-    BLEDevice::startAdvertising();
 
     server.on("/", handleRoot);
     server.on("/status", handleStatus);
@@ -687,17 +628,6 @@ void loop()
 
             // Print Local Diagnostics
             printDiagnostics();
-        }
-
-        // Bluetooth Pulse
-        if (deviceConnected)
-        {
-            StaticJsonDocument<128> bDoc;
-            bDoc["level"] = lastLevelPercent;
-            bDoc["pump"] = pumpOn;
-            String out; serializeJson(bDoc, out);
-            pStatusCharacteristic->setValue(out.c_str());
-            pStatusCharacteristic->notify();
         }
     }
 }
