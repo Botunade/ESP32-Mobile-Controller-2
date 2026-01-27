@@ -10,6 +10,8 @@
 #include <vector>
 #include <algorithm>
 #include <Firebase_ESP_Client.h>
+#include <Update.h>
+#include <HTTPClient.h>
 #include "secrets.h"
 #include "config.h"
 #include "pid.h"
@@ -86,6 +88,60 @@ void saveConfigCallback()
 {
     Serial.println("[WM] Config save triggered");
     shouldSaveConfig = true;
+}
+
+// ---------- FIRMWARE UPDATE (OTA) ----------
+
+void performOTA(String url) {
+    if (url.length() == 0) return;
+
+    logSystem("Starting OTA Update...");
+    // Disable safety WDT or reset it frequently, OTA takes time
+    esp_task_wdt_delete(NULL);
+
+    WiFiClient client;
+    HTTPClient http;
+    http.begin(client, url);
+    int httpCode = http.GET();
+
+    if (httpCode == HTTP_CODE_OK) {
+        int contentLength = http.getSize();
+        bool canBegin = Update.begin(contentLength);
+
+        if (canBegin) {
+            logSystem("Writing Firmware...");
+            WiFiClient *stream = http.getStreamPtr();
+            size_t written = Update.writeStream(*stream);
+
+            if (written == contentLength) {
+                logSystem("OTA Write Done. Verifying...");
+                if (Update.end()) {
+                    if (Update.isFinished()) {
+                        logSystem("OTA Success! Rebooting...");
+                        // Clear the update flag in DB to prevent loop
+                        Firebase.RTDB.setString(&fbdo, "/tank/firmware/update_url", "");
+                        delay(1000);
+                        ESP.restart();
+                    } else {
+                        logSystem("OTA Failed: Not Finished");
+                    }
+                } else {
+                    logSystem("OTA Error: " + String(Update.getError()));
+                }
+            } else {
+                logSystem("OTA Write Failed: Short Write");
+            }
+        } else {
+            logSystem("OTA Init Failed: Not enough space");
+        }
+    } else {
+        logSystem("OTA HTTP Failed: " + String(httpCode));
+    }
+    http.end();
+
+    // Re-enable WDT if failed
+    esp_task_wdt_init(WDT_TIMEOUT, true);
+    esp_task_wdt_add(NULL);
 }
 
 // ---------- ANALYTICS & DIAGNOSTICS ----------
@@ -268,6 +324,7 @@ void handleStatus()
     status["rssi"] = WiFi.RSSI();
     status["uptime"] = millis() / 1000;
     status["ap_mode_active"] = alwaysOnAp;
+    status["firmware_version"] = FIRMWARE_VERSION;
 
     // Aliases for compatibility
     status["setpoint_percent"] = targetLevelPercent;
@@ -405,19 +462,12 @@ void setup()
     char tStr[10]; dtostrf(targetLevelPercent, 1, 1, tStr);
 
     // Create a custom checkbox parameter for AP Mode
-    // Syntax: ID, Label, Default Value, Length, Custom HTML Attribute (e.g., "checked" or type="checkbox")
-    // WiFiManager 2.0 uses specific syntax for custom HTML
-    // We will use a standard input and interpret "1" as true
     char apStr[4];
     if (alwaysOnAp) strcpy(apStr, "1"); else strcpy(apStr, "0");
 
     WiFiManagerParameter custom_h("h", "Tank Depth (cm)", hStr, 6);
     WiFiManagerParameter custom_m("m", "Sensor Gap (cm)", mStr, 6);
     WiFiManagerParameter custom_t("t", "Primary Setpoint (%)", tStr, 6);
-
-    // Checkbox for "Always On AP"
-    // Using simple text input "1" or "0" for robustness across versions,
-    // but ideally this would be type='checkbox'
     WiFiManagerParameter custom_ap("ap", "Enable Always-On AP (1=Yes, 0=No)", apStr, 3);
 
     wm.addParameter(&custom_h);
@@ -438,6 +488,16 @@ void setup()
         Serial.println("[WIFI] Critical Fail. Restarting.");
         ESP.restart();
     }
+
+    // Force AP to stay on with defined credentials
+    if (alwaysOnAp || WiFi.getMode() == WIFI_AP_STA) {
+        WiFi.softAP(AP_SSID, AP_PASSWORD);
+        Serial.print("[WIFI] Persistent AP Active: ");
+        Serial.println(WiFi.softAPIP());
+    }
+
+    Serial.print("[WIFI] STA Connected: ");
+    Serial.println(WiFi.localIP());
 
     // Apply Saved Config
     if (shouldSaveConfig)
@@ -460,19 +520,13 @@ void setup()
             preferences.putBool("alwaysOnAp", alwaysOnAp);
             Serial.print("[CONFIG] AP Mode Updated: ");
             Serial.println(alwaysOnAp ? "ON" : "OFF");
+            // If turning on, enable AP immediately
+            if (alwaysOnAp) {
+                WiFi.mode(WIFI_AP_STA);
+                WiFi.softAP(AP_SSID, AP_PASSWORD);
+            }
         }
     }
-
-    // Enforce AP state based on config
-    if (alwaysOnAp) {
-        if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
-        WiFi.softAP(AP_SSID, AP_PASSWORD);
-        Serial.print("[WIFI] Persistent AP Active: ");
-        Serial.println(WiFi.softAPIP());
-    }
-
-    Serial.print("[WIFI] STA Connected: ");
-    Serial.println(WiFi.localIP());
 
     // 4. External Services
     config.api_key = FIREBASE_API_KEY;
@@ -545,10 +599,6 @@ void loop()
             lastLevelPercent = currentLevel;
 
             // 1. Pump Deadband Logic
-            // "when the desired setpoint is reached, the control voltage drops to zero
-            // and the pump sends a 0.0v signal to cut off the pump"
-            // Interpreting 'setpoint reached' as reaching the Pump Stop Level.
-
             if (currentLevel >= pumpStopLevel && pumpOn)
             {
                 setPump(false);
@@ -559,10 +609,6 @@ void loop()
             }
 
             // 2. Valve / Actuator Logic
-            // "control voltage drops to zero" when setpoint reached (pump off)
-            // "maintain the pumps off state until the lower dead band is reached"
-            // During this OFF state, we ensure Actuator is 0V.
-
             if (!pumpOn)
             {
                 // Force 0V (absolute zero, not 0.66V minimum)
@@ -600,6 +646,7 @@ void loop()
             status.set("dac_min_v", (currentDacMin * 3.3f / 255.0f));
             status.set("dac_max_v", (currentDacMax * 3.3f / 255.0f));
             status.set("tank_height", tankHeightCm);
+            status.set("firmware_version", FIRMWARE_VERSION);
             Firebase.RTDB.updateNode(&fbdo, "/tank/status", &status);
 
             // --- BATCH RECEIVE CONTROL/CONFIG ---
@@ -607,6 +654,15 @@ void loop()
             {
                 FirebaseJson &json = fbdo.jsonObject();
                 FirebaseJsonData data;
+
+                // OTA Trigger Check
+                if (json.get(data, "firmware/update_url") && data.typeNum == FirebaseJson::JSON_STRING)
+                {
+                    String url = data.stringValue;
+                    if (url.length() > 10) {
+                        performOTA(url);
+                    }
+                }
 
                 // Control Pulls
                 if (json.get(data, "control/target_setpoint") && data.typeNum == FirebaseJson::JSON_FLOAT)
