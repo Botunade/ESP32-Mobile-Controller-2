@@ -44,6 +44,9 @@ float tankHeightCm = TANK_HEIGHT_CM;
 float minDistanceCm = MIN_DISTANCE_CM;
 float maxDistanceCm = MAX_DISTANCE_CM;
 
+// AP Mode Toggle
+bool alwaysOnAp = false;
+
 // PID Controller Settings
 float currentKp = PID_KP;
 float currentKi = PID_KI;
@@ -264,6 +267,7 @@ void handleStatus()
     status["pid_output"] = lastPidOutput;
     status["rssi"] = WiFi.RSSI();
     status["uptime"] = millis() / 1000;
+    status["ap_mode_active"] = alwaysOnAp;
 
     // Aliases for compatibility
     status["setpoint_percent"] = targetLevelPercent;
@@ -373,6 +377,8 @@ void setup()
     pumpStartLevel = preferences.getFloat("startLevel", DEFAULT_LOWER_LIMIT);
     targetLevelPercent = preferences.getFloat("targetSetpoint", 50.0f);
 
+    alwaysOnAp = preferences.getBool("alwaysOnAp", false);
+
     currentKp = preferences.getFloat("kp", PID_KP);
     currentKi = preferences.getFloat("ki", PID_KI);
     currentKd = preferences.getFloat("kd", PID_KD);
@@ -398,16 +404,34 @@ void setup()
     char mStr[10]; dtostrf(maxDistanceCm, 1, 1, mStr);
     char tStr[10]; dtostrf(targetLevelPercent, 1, 1, tStr);
 
+    // Create a custom checkbox parameter for AP Mode
+    // Syntax: ID, Label, Default Value, Length, Custom HTML Attribute (e.g., "checked" or type="checkbox")
+    // WiFiManager 2.0 uses specific syntax for custom HTML
+    // We will use a standard input and interpret "1" as true
+    char apStr[4];
+    if (alwaysOnAp) strcpy(apStr, "1"); else strcpy(apStr, "0");
+
     WiFiManagerParameter custom_h("h", "Tank Depth (cm)", hStr, 6);
     WiFiManagerParameter custom_m("m", "Sensor Gap (cm)", mStr, 6);
     WiFiManagerParameter custom_t("t", "Primary Setpoint (%)", tStr, 6);
 
+    // Checkbox for "Always On AP"
+    // Using simple text input "1" or "0" for robustness across versions,
+    // but ideally this would be type='checkbox'
+    WiFiManagerParameter custom_ap("ap", "Enable Always-On AP (1=Yes, 0=No)", apStr, 3);
+
     wm.addParameter(&custom_h);
     wm.addParameter(&custom_m);
     wm.addParameter(&custom_t);
+    wm.addParameter(&custom_ap);
 
-    // Explicitly set AP-STA mode to ensure AP remains active after connection
-    WiFi.mode(WIFI_AP_STA);
+    // Initial Mode Set
+    if (alwaysOnAp) {
+        WiFi.mode(WIFI_AP_STA);
+        Serial.println("[BOOT] Mode: AP+STA (Persistent)");
+    } else {
+        Serial.println("[BOOT] Mode: Standard");
+    }
 
     if (!wm.autoConnect("TankLogic-Setup", "tank1234"))
     {
@@ -415,18 +439,13 @@ void setup()
         ESP.restart();
     }
 
-    // Force AP to stay on with defined credentials
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
-    Serial.print("[WIFI] AP Started: ");
-    Serial.println(WiFi.softAPIP());
-    Serial.print("[WIFI] STA Connected: ");
-    Serial.println(WiFi.localIP());
-
+    // Apply Saved Config
     if (shouldSaveConfig)
     {
         float h = atof(custom_h.getValue());
         float m = atof(custom_m.getValue());
         float t = atof(custom_t.getValue());
+        int apVal = atoi(custom_ap.getValue());
 
         updateTankHeight(h);
         if (abs(maxDistanceCm - m) > 0.1f) {
@@ -434,7 +453,26 @@ void setup()
             preferences.putFloat("maxDist", m);
         }
         updateTargetSetpoint(t);
+
+        bool newApState = (apVal == 1);
+        if (newApState != alwaysOnAp) {
+            alwaysOnAp = newApState;
+            preferences.putBool("alwaysOnAp", alwaysOnAp);
+            Serial.print("[CONFIG] AP Mode Updated: ");
+            Serial.println(alwaysOnAp ? "ON" : "OFF");
+        }
     }
+
+    // Enforce AP state based on config
+    if (alwaysOnAp) {
+        if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+        WiFi.softAP(AP_SSID, AP_PASSWORD);
+        Serial.print("[WIFI] Persistent AP Active: ");
+        Serial.println(WiFi.softAPIP());
+    }
+
+    Serial.print("[WIFI] STA Connected: ");
+    Serial.println(WiFi.localIP());
 
     // 4. External Services
     config.api_key = FIREBASE_API_KEY;
