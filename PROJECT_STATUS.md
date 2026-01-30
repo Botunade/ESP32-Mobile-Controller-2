@@ -22,31 +22,33 @@
 
 ### 3. User Interface (Web Dashboard)
 - **Tank Ultra-Console**: Modern, dark-mode web dashboard embedded in `main.py`.
+- **Local Access**: Hosted directly on the ESP32. Access via: **[http://192.168.4.1](http://192.168.4.1)** (When connected to `TankController-AP`).
 - **Features**:
   - Real-time Graphing with Setpoint Indicator.
   - Live Telemetry: Water Level %, Actuator Voltage, Pump Status.
   - Configuration: Target Setpoint, PID Tuning (Kp, Ki, Kd), Voltage Calibration (Min/Max), Geometry (Height/Dist).
   - Controls: Deadband Toggle, Manual Sync buttons.
 
-## 📂 Project Structure Guide
+## 📂 Project Structure & Development Guide
 
-### Core
-- **`main.py`**: The heart of the project. This single file contains:
+### Core (Production)
+- **`main.py`**: The **ONLY** file required to run the device. It contains:
   - **Firmware Logic**: `TankController` class, `PID` class, Hardware Drivers.
   - **Web Server**: Non-blocking socket server implementation.
   - **Frontend**: Embedded HTML/CSS/JS for the Web Dashboard.
 
-### Testing & Development
-- **`tests/`**: Contains unit tests to verify logic without hardware.
-  - **`test_main.py`**: The primary test suite. Verifies PID math, Voltage scaling logic, Deadband state transitions, and Config updates.
-- **`tests/mocks/`**: Simulation modules to allow running MicroPython code on a standard PC.
-  - **`machine.py`**: Mocks ESP32 hardware classes (`Pin`, `PWM`, `time_pulse_us`).
-  - **`network.py`**: Mocks WiFi networking classes (`WLAN`).
-  - **`time_mock.py`**: Polyfills MicroPython-specific time functions (`ticks_ms`, `ticks_diff`, `sleep_us`) for standard Python.
+### Testing Infrastructure (Development Only)
+These files are used to verify the code logic on a computer *before* uploading to the ESP32. They are **not** needed on the device itself.
 
-### Documentation
-- **`README.md`**: User guide, Hardware Pinout, and Getting Started instructions.
-- **`PROJECT_STATUS.md`**: This file. Tracks progress and architecture.
+- **`tests/test_main.py`**: The Unit Test Suite.
+  - **Purpose**: Verifies that the PID math is correct, the logic for switching the Pump ON/OFF works, and that configuration updates are handled properly.
+  - **Why use it?**: It allows finding bugs in logic (e.g., "Does the pump turn off when the tank is full?") instantly without needing to flash the chip and wire up sensors.
+
+- **`tests/mocks/`**: Hardware Simulation Modules.
+  - **Purpose**: Standard Python (on a PC) doesn't know what `import machine` or `import network` means. These files "pretend" to be the ESP32 hardware so `main.py` can run during tests.
+  - **`machine.py`**: Simulates Pins, PWM, and Pulse timing. It allows the test to say "Set Pin 4 High" and verify it happened.
+  - **`network.py`**: Simulates the WiFi interface logic.
+  - **`time_mock.py`**: Adds MicroPython-specific timing functions (`ticks_ms`) to standard Python's `time` module.
 
 ## 🔧 Hardware Pinout (ESP32)
 
