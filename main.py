@@ -25,8 +25,8 @@ WIFI_PASS = 'tankwater'
 
 TRIG_PIN_NUM = 5
 ECHO_PIN_NUM = 18
-ACTUATOR_PIN_NUM = 26 # Analog/PWM Control Voltage
-PUMP_PIN_NUM = 16     # Digital Pump Control
+ACTUATOR_PIN_NUM = 26
+PUMP_PIN_NUM = 16
 LED_PIN_NUM = 2
 
 DEFAULT_CONFIG = {
@@ -35,7 +35,7 @@ DEFAULT_CONFIG = {
     "max_dist": 180.0,
     # Control
     "target_setpoint": 50.0,
-    "deadband_enabled": True, # Default enabled for safety
+    "deadband_enabled": True,
     "stop_level": 90.0,
     "start_level": 10.0,
     # PID
@@ -43,9 +43,9 @@ DEFAULT_CONFIG = {
     "ki": 0.1,
     "kd": 0.0,
     # Output
-    "dac_offset_v": 0.66,    # Offset Voltage
-    "dac_max_v": 3.3,        # Max System Voltage
-    "valve_max_duty": 1023   # PWM Resolution
+    "dac_min_v": 0.66,       # Min Voltage (0% PID)
+    "dac_max_v": 3.3,        # Max Voltage (100% PID)
+    "valve_max_duty": 1023
 }
 
 # ==========================================
@@ -61,7 +61,7 @@ class PID:
         self.out_max = out_max
         self._integral = 0
         self._last_error = 0
-        self._last_time = time.time()
+        self._last_time = time.ticks_ms()
 
     def update_params(self, kp, ki, kd):
         self.kp = kp
@@ -69,8 +69,8 @@ class PID:
         self.kd = kd
 
     def compute(self, input_val):
-        current_time = time.time()
-        dt = current_time - self._last_time
+        current_time = time.ticks_ms()
+        dt = time.ticks_diff(current_time, self._last_time) / 1000.0
         if dt <= 0: dt = 0.1
 
         error = self.setpoint - input_val
@@ -124,8 +124,8 @@ class TankController:
         self.pid = PID(0,0,0,0)
 
         self.level_percent = 0.0
-        self.valve_percent = 0.0 # PID Output 0-100
-        self.actuator_voltage = 0.0 # Actual Voltage
+        self.valve_percent = 0.0
+        self.actuator_voltage = 0.0
         self.pump_on = False
         self.simulated_level = 50.0
         self.pump_active_latch = False
@@ -133,10 +133,6 @@ class TankController:
     def read_distance(self):
         if self.trig is None:
             # Sim logic
-            # Filling depends on Actuator Voltage? Or Valve %?
-            # Let's say Valve % represents flow rate potential.
-            # Pump must be ON for flow.
-
             flow_potential = self.valve_percent / 100.0
             if not self.pump_on: flow_potential = 0
 
@@ -154,7 +150,27 @@ class TankController:
             span = empty - full_dist
             dist = empty - (self.simulated_level / 100.0 * span)
             return dist
-        return 0
+
+        # Hardware Read
+        try:
+            self.trig.value(0)
+            time.sleep_us(2)
+            self.trig.value(1)
+            time.sleep_us(10)
+            self.trig.value(0)
+
+            # Timeout 30ms (approx 5m max distance)
+            pulse_duration = machine.time_pulse_us(self.echo, 1, 30000)
+
+            if pulse_duration < 0:
+                return self.config['max_dist'] # Timeout or error
+
+            # Sound speed 343m/s -> 0.0343 cm/us
+            # Distance = (Duration * Speed) / 2
+            distance = (pulse_duration * 0.0343) / 2
+            return distance
+        except:
+            return 0
 
     def update(self):
         # 1. Config
@@ -182,33 +198,26 @@ class TankController:
                 self.pump_active_latch = True
             self.pump_on = self.pump_active_latch
         else:
-            # If Deadband Disabled, Pump is Always Active?
-            # Or manual control? Assuming Always Active for PID to work.
             self.pump_on = True
 
-        # 4. PID Calc (Actuator)
+        # 4. PID Calc
         pid_out = self.pid.compute(self.level_percent)
         self.valve_percent = pid_out
 
         # 5. Output Logic
-        # Calculate Target Voltage
-        # V = Offset + (PID% * (Max - Offset))
-        offset = self.config['dac_offset_v']
+        # V = Min + (PID% * (Max - Min))
+        min_v = self.config['dac_min_v']
         max_v = self.config['dac_max_v']
 
         if self.pump_on:
-             # Scale PID (0-100) to (Offset-MaxV)
-             voltage_span = max_v - offset
+             voltage_span = max_v - min_v
              if voltage_span < 0: voltage_span = 0
-             self.actuator_voltage = offset + (self.valve_percent / 100.0 * voltage_span)
+             self.actuator_voltage = min_v + (self.valve_percent / 100.0 * voltage_span)
         else:
-             # If Pump is OFF, Force Actuator 0V (or Offset?)
-             # "Force the pin to be zero" was for Pump pin.
-             # Reasonable to set Actuator to 0V if system is off.
              self.actuator_voltage = 0.0
 
         # Clamp
-        if self.actuator_voltage > max_v: self.actuator_voltage = max_v
+        if self.actuator_voltage > 3.3: self.actuator_voltage = 3.3 # HW Limit
         if self.actuator_voltage < 0: self.actuator_voltage = 0
 
         # Apply to Hardware
@@ -216,12 +225,11 @@ class TankController:
             self.pump.value(1 if self.pump_on else 0)
 
         if self.actuator:
-            # Map Voltage to Duty
-            # Duty = (V / MaxV) * Resolution
-            if max_v > 0:
-                duty_fraction = self.actuator_voltage / max_v
-            else:
-                duty_fraction = 0
+            # Map Voltage to Duty (Assuming 3.3V Max HW)
+            # Duty = (V / 3.3) * Resolution
+            hw_max_v = 3.3
+            duty_fraction = self.actuator_voltage / hw_max_v
+            if duty_fraction > 1.0: duty_fraction = 1.0
 
             duty_res = self.config.get('valve_max_duty', 1023)
             duty = int(duty_fraction * duty_res)
@@ -352,16 +360,17 @@ HTML_CONTENT = """<!DOCTYPE html>
                 <div class="input-group"><label class="label">Kp</label><input type="number" id="inKp" step="0.1"></div>
                 <div class="input-group"><label class="label">Ki</label><input type="number" id="inKi" step="0.01"></div>
                 <div class="input-group"><label class="label">Kd</label><input type="number" id="inKd" step="0.01"></div>
-                <div class="input-group"><label class="label">Offset (V)</label><input type="number" id="inOffset" step="0.01"></div>
+                <div class="input-group"><label class="label">Min (V)</label><input type="number" id="inMinV" step="0.01"></div>
+                <div class="input-group"><label class="label">Max (V)</label><input type="number" id="inMaxV" step="0.01"></div>
             </div>
             <button class="secondary" id="btnTun">Update Tuning</button>
             <div class="active-config">
                 <div class="config-row"><span>Gains [P/I/D]:</span><span class="config-value" id="valPid">--</span></div>
-                <div class="config-row"><span>Offset:</span><span class="config-value" id="valOffset">--V</span></div>
+                <div class="config-row"><span>Range:</span><span class="config-value" id="valRange">--V</span></div>
             </div>
         </div>
 
-        <footer>Tank Controller Pro • v2.2 • MicroPython</footer>
+        <footer>Tank Controller Pro • v2.3 • MicroPython</footer>
     </div>
 
     <script>
@@ -369,12 +378,12 @@ HTML_CONTENT = """<!DOCTYPE html>
             dot: document.getElementById('dot'), st: document.getElementById('stTxt'),
             lvl: document.getElementById('lvl'), volt: document.getElementById('volt'),
             vTarget: document.getElementById('valTarget'), vPump: document.getElementById('valPump'), vPumpSt: document.getElementById('valPumpStatus'),
-            vH: document.getElementById('valH'), vM: document.getElementById('valM'), vPid: document.getElementById('valPid'), vOffset: document.getElementById('valOffset'),
+            vH: document.getElementById('valH'), vM: document.getElementById('valM'), vPid: document.getElementById('valPid'), vRange: document.getElementById('valRange'),
             iTarget: document.getElementById('inTarget'), iStop: document.getElementById('inStop'),
             iStart: document.getElementById('inStart'), iH: document.getElementById('inH'),
             iM: document.getElementById('inM'), iKp: document.getElementById('inKp'),
             iKi: document.getElementById('inKi'), iKd: document.getElementById('inKd'),
-            iOffset: document.getElementById('inOffset'),
+            iMinV: document.getElementById('inMinV'), iMaxV: document.getElementById('inMaxV'),
             chkDB: document.getElementById('chkDeadband')
         };
 
@@ -414,7 +423,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                 el.vH.innerText = `${d.tank_height} cm`;
                 el.vM.innerText = `${d.max_dist} cm`;
                 el.vPid.innerText = `[${d.kp}, ${d.ki}, ${d.kd}]`;
-                el.vOffset.innerText = `${d.dac_offset_v}V`;
+                el.vRange.innerText = `${d.dac_min_v}V - ${d.dac_max_v}V`;
 
                 if(document.activeElement !== el.chkDB) el.chkDB.checked = d.deadband_enabled;
 
@@ -442,7 +451,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         document.getElementById('btnHw').onclick = () => postConfig({ tank_height: parseFloat(el.iH.value), max_dist: parseFloat(el.iM.value) });
         document.getElementById('btnTun').onclick = () => postConfig({
             kp: parseFloat(el.iKp.value), ki: parseFloat(el.iKi.value), kd: parseFloat(el.iKd.value),
-            dac_offset_v: parseFloat(el.iOffset.value)
+            dac_min_v: parseFloat(el.iMinV.value), dac_max_v: parseFloat(el.iMaxV.value)
         });
     </script>
 </body>
