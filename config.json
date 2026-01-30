@@ -1,1 +1,14 @@
-{"setpoint": 80, "lower_limit": 40, "tank_height_cm": 200, "min_distance_cm": 0, "max_distance_cm": 200, "pump_pin": 23, "trig_pin": 5, "echo_pin": 18, "wifi_ssid": "TankController-AP", "wifi_pass": "tankwater"}
+{
+    "tank_height": 200.0,
+    "max_dist": 180.0,
+    "target_setpoint": 50.0,
+    "deadband_enabled": true,
+    "stop_level": 90.0,
+    "start_level": 10.0,
+    "kp": 1.0,
+    "ki": 0.1,
+    "kd": 0.0,
+    "dac_min_v": 0.66,
+    "dac_max_v": 3.3,
+    "valve_max_duty": 1023
+}
