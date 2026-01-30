@@ -1,85 +1,61 @@
 # Tank Controller Project - Current Status
 
-**Last Updated:** 2025-12-04 23:30
+**Last Updated:** 2025-12-05
 
 ## ✅ Completed Tasks
 
-### 1. Project Merge
-- Successfully merged `water level` firmware and `tank-controller-app` into unified `TankController` directory
-- Cleaned up old directories and temporary files
-- Final structure:
-  ```
-  TankController/
-  ├── firmware/           # ESP32 PlatformIO project
-  ├── mobile-app/         # React Native Expo app
-  ├── hardware-test/      # Hardware testing sketches
-  ├── firmware-future/    # Experimental features
-  └── README.md
-  ```
+### 1. Architecture Overhaul
+- **Single-File Firmware**: Consolidated entire application (Logic + Web Server + UI) into `main.py` for MicroPython.
+- **Legacy Cleanup**: Removed C++ firmware (`hardware-test`), legacy React Native app (`mobile-app`), and Electron app (`desktop-app`).
+- **Bluetooth Removal**: Completely removed all BLE code, focusing on WiFi Access Point mode.
 
-### 2. Mobile App Setup
-- ✅ Installed npm dependencies
-- ✅ Successfully ran Expo web server
-- ✅ Verified app interface at http://localhost:8081
-- App features confirmed working:
-  - Controller host configuration
-  - Setpoint control
-  - PID parameter adjustment (Kp, Ki, Kd)
-  - Handshake button for ESP32 connection
-  - Send to ESP32 button
-  - Water level live monitoring section
+### 2. Control Logic Implementation
+- **PID Controller**: Implemented robust PID algorithm (`PID` class) replacing simple hysteresis.
+  - Features: Proportional, Integral, Derivative terms with Anti-Windup.
+  - Precision Timing: Uses `time.ticks_ms()` for accurate `dt` calculation.
+- **Hybrid Deadband**: Added optional Safety Hysteresis mode.
+  - Logic: Gates the PID output. Forces Pump OFF if > Stop Limit. Forces Pump ON (PID Active) if < Start Limit.
+- **Hardware Drivers**:
+  - **Actuator**: PWM/DAC on Pin 26 with Precision Voltage Calibration (Min/Max V mapping).
+  - **Pump**: Digital Control on Pin 16 with Safety Interlock (Actuator forced 0V if Pump OFF).
+  - **Sensor**: HC-SR04 Driver on Pins 5 (Trig) / 18 (Echo).
 
-## 📋 Next Steps
+### 3. User Interface (Web Dashboard)
+- **Tank Ultra-Console**: Modern, dark-mode web dashboard embedded in `main.py`.
+- **Local Access**: Hosted directly on the ESP32. Access via: **[http://192.168.4.1](http://192.168.4.1)** (When connected to `TankController-AP`).
+- **Features**:
+  - Real-time Graphing with Setpoint Indicator.
+  - Live Telemetry: Water Level %, Actuator Voltage, Pump Status.
+  - Configuration: Target Setpoint, PID Tuning (Kp, Ki, Kd), Voltage Calibration (Min/Max), Geometry (Height/Dist).
+  - Controls: Deadband Toggle, Manual Sync buttons.
 
-### To Run the Mobile App
-```bash
-cd c:\Users\user\Documents\PlatformIO\Projects\TankController\mobile-app
-npx expo start --web
-```
-Then open http://localhost:8081 in your browser.
+## 📂 Project Structure & Development Guide
 
-### To Upload Firmware to ESP32
-```bash
-cd c:\Users\user\Documents\PlatformIO\Projects\TankController\firmware
-pio run --target upload
-pio device monitor
-```
+### Core (Production)
+- **`main.py`**: The **ONLY** file required to run the device. It contains:
+  - **Firmware Logic**: `TankController` class, `PID` class, Hardware Drivers.
+  - **Web Server**: Non-blocking socket server implementation.
+  - **Frontend**: Embedded HTML/CSS/JS for the Web Dashboard.
 
-### To Test Full System
-1. Upload firmware to ESP32
-2. ESP32 will create WiFi AP: `TankController-AP` (password: `tankwater`)
-3. Connect your computer to the ESP32's WiFi network
-4. Run the mobile app
-5. Enter `192.168.4.1` in the Controller host field
-6. Click Handshake to test connection
-7. Adjust setpoint and PID parameters as needed
-8. Click Send to ESP32 to apply settings
+### Testing Infrastructure (Development Only)
+These files are used to verify the code logic on a computer *before* uploading to the ESP32. They are **not** needed on the device itself.
 
-## 🔧 Project Files
+- **`tests/test_main.py`**: The Unit Test Suite.
+  - **Purpose**: Verifies that the PID math is correct, the logic for switching the Pump ON/OFF works, and that configuration updates are handled properly.
+  - **Why use it?**: It allows finding bugs in logic (e.g., "Does the pump turn off when the tank is full?") instantly without needing to flash the chip and wire up sensors.
 
-### Firmware
-- **Main code:** `firmware/src/main.cpp`
-- **Configuration:** `firmware/include/config.h`
-- **PlatformIO config:** `firmware/platformio.ini`
+- **`tests/mocks/`**: Hardware Simulation Modules.
+  - **Purpose**: Standard Python (on a PC) doesn't know what `import machine` or `import network` means. These files "pretend" to be the ESP32 hardware so `main.py` can run during tests.
+  - **`machine.py`**: Simulates Pins, PWM, and Pulse timing. It allows the test to say "Set Pin 4 High" and verify it happened.
+  - **`network.py`**: Simulates the WiFi interface logic.
+  - **`time_mock.py`**: Adds MicroPython-specific timing functions (`ticks_ms`) to standard Python's `time` module.
 
-### Mobile App
-- **Package config:** `mobile-app/package.json`
-- **App config:** `mobile-app/app.json`
-- **Main screens:** `mobile-app/app/(tabs)/`
+## 🔧 Hardware Pinout (ESP32)
 
-## 📝 Notes
-
-- Mobile app dependencies are installed and ready
-- Firmware is ready to upload (no compilation errors)
-- Both projects are communicating via REST API:
-  - GET `/` - System info
-  - GET `/status` - Telemetry data
-  - POST `/pid` - Update PID parameters
-
-## 🎯 Future Enhancements
-
-- Add real-time graphing of water level
-- Implement data logging
-- Add notifications for critical levels
-- Create mobile builds for Android/iOS
-- Add WiFi configuration through the app
+| Component | Pin | Type | Function |
+|-----------|-----|------|----------|
+| **Actuator** | 26 | Analog/PWM | Proportional Valve Control (0-3.3V) |
+| **Pump** | 16 | Digital | On/Off Control (Interlocked) |
+| **Trig** | 5 | Digital | Ultrasonic Trigger |
+| **Echo** | 18 | Digital | Ultrasonic Echo |
+| **LED** | 2 | Digital | Status Indicator |
