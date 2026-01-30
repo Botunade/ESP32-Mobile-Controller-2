@@ -1,85 +1,59 @@
 # Tank Controller Project - Current Status
 
-**Last Updated:** 2025-12-04 23:30
+**Last Updated:** 2025-12-05
 
 ## ✅ Completed Tasks
 
-### 1. Project Merge
-- Successfully merged `water level` firmware and `tank-controller-app` into unified `TankController` directory
-- Cleaned up old directories and temporary files
-- Final structure:
-  ```
-  TankController/
-  ├── firmware/           # ESP32 PlatformIO project
-  ├── mobile-app/         # React Native Expo app
-  ├── hardware-test/      # Hardware testing sketches
-  ├── firmware-future/    # Experimental features
-  └── README.md
-  ```
+### 1. Architecture Overhaul
+- **Single-File Firmware**: Consolidated entire application (Logic + Web Server + UI) into `main.py` for MicroPython.
+- **Legacy Cleanup**: Removed C++ firmware (`hardware-test`), legacy React Native app (`mobile-app`), and Electron app (`desktop-app`).
+- **Bluetooth Removal**: Completely removed all BLE code, focusing on WiFi Access Point mode.
 
-### 2. Mobile App Setup
-- ✅ Installed npm dependencies
-- ✅ Successfully ran Expo web server
-- ✅ Verified app interface at http://localhost:8081
-- App features confirmed working:
-  - Controller host configuration
-  - Setpoint control
-  - PID parameter adjustment (Kp, Ki, Kd)
-  - Handshake button for ESP32 connection
-  - Send to ESP32 button
-  - Water level live monitoring section
+### 2. Control Logic Implementation
+- **PID Controller**: Implemented robust PID algorithm (`PID` class) replacing simple hysteresis.
+  - Features: Proportional, Integral, Derivative terms with Anti-Windup.
+  - Precision Timing: Uses `time.ticks_ms()` for accurate `dt` calculation.
+- **Hybrid Deadband**: Added optional Safety Hysteresis mode.
+  - Logic: Gates the PID output. Forces Pump OFF if > Stop Limit. Forces Pump ON (PID Active) if < Start Limit.
+- **Hardware Drivers**:
+  - **Actuator**: PWM/DAC on Pin 26 with Precision Voltage Calibration (Min/Max V mapping).
+  - **Pump**: Digital Control on Pin 16 with Safety Interlock (Actuator forced 0V if Pump OFF).
+  - **Sensor**: HC-SR04 Driver on Pins 5 (Trig) / 18 (Echo).
 
-## 📋 Next Steps
+### 3. User Interface (Web Dashboard)
+- **Tank Ultra-Console**: Modern, dark-mode web dashboard embedded in `main.py`.
+- **Features**:
+  - Real-time Graphing with Setpoint Indicator.
+  - Live Telemetry: Water Level %, Actuator Voltage, Pump Status.
+  - Configuration: Target Setpoint, PID Tuning (Kp, Ki, Kd), Voltage Calibration (Min/Max), Geometry (Height/Dist).
+  - Controls: Deadband Toggle, Manual Sync buttons.
 
-### To Run the Mobile App
-```bash
-cd c:\Users\user\Documents\PlatformIO\Projects\TankController\mobile-app
-npx expo start --web
-```
-Then open http://localhost:8081 in your browser.
+## 📂 Project Structure Guide
 
-### To Upload Firmware to ESP32
-```bash
-cd c:\Users\user\Documents\PlatformIO\Projects\TankController\firmware
-pio run --target upload
-pio device monitor
-```
+### Core
+- **`main.py`**: The heart of the project. This single file contains:
+  - **Firmware Logic**: `TankController` class, `PID` class, Hardware Drivers.
+  - **Web Server**: Non-blocking socket server implementation.
+  - **Frontend**: Embedded HTML/CSS/JS for the Web Dashboard.
 
-### To Test Full System
-1. Upload firmware to ESP32
-2. ESP32 will create WiFi AP: `TankController-AP` (password: `tankwater`)
-3. Connect your computer to the ESP32's WiFi network
-4. Run the mobile app
-5. Enter `192.168.4.1` in the Controller host field
-6. Click Handshake to test connection
-7. Adjust setpoint and PID parameters as needed
-8. Click Send to ESP32 to apply settings
+### Testing & Development
+- **`tests/`**: Contains unit tests to verify logic without hardware.
+  - **`test_main.py`**: The primary test suite. Verifies PID math, Voltage scaling logic, Deadband state transitions, and Config updates.
+- **`tests/mocks/`**: Simulation modules to allow running MicroPython code on a standard PC.
+  - **`machine.py`**: Mocks ESP32 hardware classes (`Pin`, `PWM`, `time_pulse_us`).
+  - **`network.py`**: Mocks WiFi networking classes (`WLAN`).
+  - **`time_mock.py`**: Polyfills MicroPython-specific time functions (`ticks_ms`, `ticks_diff`, `sleep_us`) for standard Python.
 
-## 🔧 Project Files
+### Documentation
+- **`README.md`**: User guide, Hardware Pinout, and Getting Started instructions.
+- **`PROJECT_STATUS.md`**: This file. Tracks progress and architecture.
 
-### Firmware
-- **Main code:** `firmware/src/main.cpp`
-- **Configuration:** `firmware/include/config.h`
-- **PlatformIO config:** `firmware/platformio.ini`
+## 🔧 Hardware Pinout (ESP32)
 
-### Mobile App
-- **Package config:** `mobile-app/package.json`
-- **App config:** `mobile-app/app.json`
-- **Main screens:** `mobile-app/app/(tabs)/`
-
-## 📝 Notes
-
-- Mobile app dependencies are installed and ready
-- Firmware is ready to upload (no compilation errors)
-- Both projects are communicating via REST API:
-  - GET `/` - System info
-  - GET `/status` - Telemetry data
-  - POST `/pid` - Update PID parameters
-
-## 🎯 Future Enhancements
-
-- Add real-time graphing of water level
-- Implement data logging
-- Add notifications for critical levels
-- Create mobile builds for Android/iOS
-- Add WiFi configuration through the app
+| Component | Pin | Type | Function |
+|-----------|-----|------|----------|
+| **Actuator** | 26 | Analog/PWM | Proportional Valve Control (0-3.3V) |
+| **Pump** | 16 | Digital | On/Off Control (Interlocked) |
+| **Trig** | 5 | Digital | Ultrasonic Trigger |
+| **Echo** | 18 | Digital | Ultrasonic Echo |
+| **LED** | 2 | Digital | Status Indicator |
