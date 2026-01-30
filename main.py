@@ -25,7 +25,8 @@ WIFI_PASS = 'tankwater'
 
 TRIG_PIN_NUM = 5
 ECHO_PIN_NUM = 18
-VALVE_PIN_NUM = 4
+ACTUATOR_PIN_NUM = 26 # Analog/PWM Control Voltage
+PUMP_PIN_NUM = 16     # Digital Pump Control
 LED_PIN_NUM = 2
 
 DEFAULT_CONFIG = {
@@ -34,7 +35,7 @@ DEFAULT_CONFIG = {
     "max_dist": 180.0,
     # Control
     "target_setpoint": 50.0,
-    "deadband_enabled": False, # Toggle
+    "deadband_enabled": True, # Default enabled for safety
     "stop_level": 90.0,
     "start_level": 10.0,
     # PID
@@ -42,9 +43,9 @@ DEFAULT_CONFIG = {
     "ki": 0.1,
     "kd": 0.0,
     # Output
-    "dac_min_v": 0.0,
-    "dac_max_v": 3.3,
-    "valve_max_duty": 1023
+    "dac_offset_v": 0.66,    # Offset Voltage
+    "dac_max_v": 3.3,        # Max System Voltage
+    "valve_max_duty": 1023   # PWM Resolution
 }
 
 # ==========================================
@@ -106,27 +107,40 @@ class TankController:
         try:
             self.trig = Pin(TRIG_PIN_NUM, Pin.OUT)
             self.echo = Pin(ECHO_PIN_NUM, Pin.IN)
-            self.valve = PWM(Pin(VALVE_PIN_NUM), freq=1000)
+            self.actuator = PWM(Pin(ACTUATOR_PIN_NUM), freq=1000)
+            self.pump = Pin(PUMP_PIN_NUM, Pin.OUT)
             self.led = Pin(LED_PIN_NUM, Pin.OUT)
-            self.valve.duty(0)
+
+            self.actuator.duty(0)
+            self.pump.value(0)
             self.led.value(0)
         except:
             print("Hardware init failed (Simulating)")
             self.trig = None
-            self.valve = None
+            self.actuator = None
+            self.pump = None
             self.led = None
 
         self.pid = PID(0,0,0,0)
 
         self.level_percent = 0.0
-        self.valve_percent = 0.0
+        self.valve_percent = 0.0 # PID Output 0-100
+        self.actuator_voltage = 0.0 # Actual Voltage
+        self.pump_on = False
         self.simulated_level = 50.0
-        self.pump_active_latch = True # For Hysteresis State
+        self.pump_active_latch = False
 
     def read_distance(self):
         if self.trig is None:
-            # Sim
-            fill_rate = (self.valve_percent / 100.0) * 1.5
+            # Sim logic
+            # Filling depends on Actuator Voltage? Or Valve %?
+            # Let's say Valve % represents flow rate potential.
+            # Pump must be ON for flow.
+
+            flow_potential = self.valve_percent / 100.0
+            if not self.pump_on: flow_potential = 0
+
+            fill_rate = flow_potential * 1.5
             drain_rate = 0.5
             self.simulated_level += (fill_rate - drain_rate)
             if self.simulated_level < 0: self.simulated_level = 0
@@ -143,7 +157,7 @@ class TankController:
         return 0
 
     def update(self):
-        # 1. Config Sync
+        # 1. Config
         self.pid.update_params(self.config['kp'], self.config['ki'], self.config['kd'])
         self.pid.setpoint = self.config['target_setpoint']
 
@@ -160,38 +174,64 @@ class TankController:
         if self.level_percent < 0: self.level_percent = 0
         if self.level_percent > 100: self.level_percent = 100
 
-        # 3. PID Calc
-        pid_out = self.pid.compute(self.level_percent)
-
-        # 4. Deadband Logic
+        # 3. Deadband (Pump Logic)
         if self.config['deadband_enabled']:
-            # Hysteresis Logic triggers Enabled/Disabled state
             if self.level_percent >= self.config['stop_level']:
                 self.pump_active_latch = False
             elif self.level_percent <= self.config['start_level']:
                 self.pump_active_latch = True
-
-            # If latched ON, use PID value. If OFF, use 0.
-            if self.pump_active_latch:
-                self.valve_percent = pid_out
-            else:
-                self.valve_percent = 0.0
+            self.pump_on = self.pump_active_latch
         else:
-            # Pure PID
-            self.valve_percent = pid_out
-            self.pump_active_latch = True # Always active in pure PID
+            # If Deadband Disabled, Pump is Always Active?
+            # Or manual control? Assuming Always Active for PID to work.
+            self.pump_on = True
 
-        # 5. Output
-        if self.valve:
-            duty_max = self.config.get('valve_max_duty', 1023)
-            duty = int((self.valve_percent / 100.0) * duty_max)
-            self.valve.duty(duty)
+        # 4. PID Calc (Actuator)
+        pid_out = self.pid.compute(self.level_percent)
+        self.valve_percent = pid_out
+
+        # 5. Output Logic
+        # Calculate Target Voltage
+        # V = Offset + (PID% * (Max - Offset))
+        offset = self.config['dac_offset_v']
+        max_v = self.config['dac_max_v']
+
+        if self.pump_on:
+             # Scale PID (0-100) to (Offset-MaxV)
+             voltage_span = max_v - offset
+             if voltage_span < 0: voltage_span = 0
+             self.actuator_voltage = offset + (self.valve_percent / 100.0 * voltage_span)
+        else:
+             # If Pump is OFF, Force Actuator 0V (or Offset?)
+             # "Force the pin to be zero" was for Pump pin.
+             # Reasonable to set Actuator to 0V if system is off.
+             self.actuator_voltage = 0.0
+
+        # Clamp
+        if self.actuator_voltage > max_v: self.actuator_voltage = max_v
+        if self.actuator_voltage < 0: self.actuator_voltage = 0
+
+        # Apply to Hardware
+        if self.pump:
+            self.pump.value(1 if self.pump_on else 0)
+
+        if self.actuator:
+            # Map Voltage to Duty
+            # Duty = (V / MaxV) * Resolution
+            if max_v > 0:
+                duty_fraction = self.actuator_voltage / max_v
+            else:
+                duty_fraction = 0
+
+            duty_res = self.config.get('valve_max_duty', 1023)
+            duty = int(duty_fraction * duty_res)
+            self.actuator.duty(duty)
 
         if self.led:
-            self.led.value(1 if self.valve_percent > 10 else 0)
+            self.led.value(1 if self.pump_on else 0)
 
 # ==========================================
-# HTML CONTENT (Tank Ultra-Console)
+# HTML CONTENT
 # ==========================================
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="en">
@@ -232,9 +272,8 @@ HTML_CONTENT = """<!DOCTYPE html>
         .chart-container { height: 160px; margin: 12px -8px 0 -8px; }
         footer { text-align: center; padding: 24px 0 40px; font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; }
 
-        /* Toggle Switch */
         .switch { position: relative; display: inline-block; width: 40px; height: 20px; }
-        .switch input { opacity: 0; width: 0; height: 0; }
+        .switch input { opacity: 0; width: 0; height: 0; position: absolute; }
         .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #334155; transition: .4s; border-radius: 20px; }
         .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 2px; bottom: 2px; background-color: white; transition: .4s; border-radius: 50%; }
         input:checked + .slider { background-color: var(--accent); }
@@ -258,8 +297,8 @@ HTML_CONTENT = """<!DOCTYPE html>
                 <div class="metric-value" id="lvl">--<span class="metric-unit">%</span></div>
             </div>
             <div class="metric-card">
-                <div class="metric-label">Valve Output</div>
-                <div class="metric-value" id="pmp" style="font-size: 1.5rem;">--%</div>
+                <div class="metric-label">Actuator Voltage</div>
+                <div class="metric-value" id="volt" style="font-size: 1.5rem;">--V</div>
             </div>
         </div>
 
@@ -288,7 +327,10 @@ HTML_CONTENT = """<!DOCTYPE html>
                 <div class="input-group"><label class="label">Start Limit (%)</label><input type="number" id="inStart" placeholder="10"></div>
             </div>
             <button class="secondary" id="btnPump">Apply Deadband</button>
-            <div class="active-config"><div class="config-row"><span>Start/Stop:</span><span class="config-value" id="valPump">-- / --%</span></div></div>
+            <div class="active-config">
+                <div class="config-row"><span>Start/Stop:</span><span class="config-value" id="valPump">-- / --%</span></div>
+                <div class="config-row"><span>Pump Status:</span><span class="config-value" id="valPumpStatus">--</span></div>
+            </div>
         </div>
 
         <div class="card">
@@ -310,31 +352,37 @@ HTML_CONTENT = """<!DOCTYPE html>
                 <div class="input-group"><label class="label">Kp</label><input type="number" id="inKp" step="0.1"></div>
                 <div class="input-group"><label class="label">Ki</label><input type="number" id="inKi" step="0.01"></div>
                 <div class="input-group"><label class="label">Kd</label><input type="number" id="inKd" step="0.01"></div>
+                <div class="input-group"><label class="label">Offset (V)</label><input type="number" id="inOffset" step="0.01"></div>
             </div>
             <button class="secondary" id="btnTun">Update Tuning</button>
             <div class="active-config">
                 <div class="config-row"><span>Gains [P/I/D]:</span><span class="config-value" id="valPid">--</span></div>
+                <div class="config-row"><span>Offset:</span><span class="config-value" id="valOffset">--V</span></div>
             </div>
         </div>
 
-        <footer>Tank Controller Pro • v2.1 • MicroPython</footer>
+        <footer>Tank Controller Pro • v2.2 • MicroPython</footer>
     </div>
 
     <script>
         const el = {
             dot: document.getElementById('dot'), st: document.getElementById('stTxt'),
-            lvl: document.getElementById('lvl'), pmp: document.getElementById('pmp'),
-            vTarget: document.getElementById('valTarget'), vPump: document.getElementById('valPump'),
-            vH: document.getElementById('valH'), vM: document.getElementById('valM'), vPid: document.getElementById('valPid'),
+            lvl: document.getElementById('lvl'), volt: document.getElementById('volt'),
+            vTarget: document.getElementById('valTarget'), vPump: document.getElementById('valPump'), vPumpSt: document.getElementById('valPumpStatus'),
+            vH: document.getElementById('valH'), vM: document.getElementById('valM'), vPid: document.getElementById('valPid'), vOffset: document.getElementById('valOffset'),
             iTarget: document.getElementById('inTarget'), iStop: document.getElementById('inStop'),
             iStart: document.getElementById('inStart'), iH: document.getElementById('inH'),
             iM: document.getElementById('inM'), iKp: document.getElementById('inKp'),
             iKi: document.getElementById('inKi'), iKd: document.getElementById('inKd'),
+            iOffset: document.getElementById('inOffset'),
             chkDB: document.getElementById('chkDeadband')
         };
 
         const chart = new Chart(document.getElementById('chart').getContext('2d'), {
-            type: 'line', data: { labels: Array(60).fill(''), datasets: [{ data: Array(60).fill(null), borderColor: '#22d3ee', borderWidth: 3, tension: 0.4, pointRadius: 0, fill: true, backgroundColor: 'rgba(34, 211, 238, 0.05)' }] },
+            type: 'line', data: { labels: Array(60).fill(''), datasets: [
+                { label: 'Level', data: Array(60).fill(null), borderColor: '#22d3ee', borderWidth: 3, tension: 0.4, pointRadius: 0, fill: true, backgroundColor: 'rgba(34, 211, 238, 0.05)' },
+                { label: 'Setpoint', data: Array(60).fill(null), borderColor: '#fbbf24', borderWidth: 2, borderDash: [5, 5], pointRadius: 0, fill: false }
+            ]},
             options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { min: 0, max: 100, grid: { color: 'rgba(255,255,255,0.02)' }, ticks: { display: false } } }, animation: false }
         });
 
@@ -356,19 +404,26 @@ HTML_CONTENT = """<!DOCTYPE html>
                 el.st.style.color = "var(--success)";
 
                 el.lvl.innerHTML = `${d.level_percent.toFixed(0)}<span class="metric-unit">%</span>`;
-                el.pmp.innerText = `${d.valve_percent.toFixed(0)}%`;
+                el.volt.innerText = `${d.actuator_voltage.toFixed(2)}V`;
 
                 el.vTarget.innerText = `${d.target_setpoint}%`;
                 el.vPump.innerText = `${d.start_level}% - ${d.stop_level}% (${d.deadband_enabled ? 'ON' : 'OFF'})`;
+                el.vPumpSt.innerText = d.pump_on ? "ACTIVE" : "STOPPED";
+                el.vPumpSt.style.color = d.pump_on ? "var(--success)" : "var(--danger)";
+
                 el.vH.innerText = `${d.tank_height} cm`;
                 el.vM.innerText = `${d.max_dist} cm`;
                 el.vPid.innerText = `[${d.kp}, ${d.ki}, ${d.kd}]`;
+                el.vOffset.innerText = `${d.dac_offset_v}V`;
 
-                // Update Checkbox State if not focused
                 if(document.activeElement !== el.chkDB) el.chkDB.checked = d.deadband_enabled;
 
-                if(chart.data.datasets[0].data.length >= 60) chart.data.datasets[0].data.shift();
+                if(chart.data.datasets[0].data.length >= 60) {
+                    chart.data.datasets[0].data.shift();
+                    chart.data.datasets[1].data.shift();
+                }
                 chart.data.datasets[0].data.push(d.level_percent);
+                chart.data.datasets[1].data.push(d.target_setpoint);
                 chart.update('none');
 
             } catch(e) {
@@ -386,7 +441,8 @@ HTML_CONTENT = """<!DOCTYPE html>
         document.getElementById('btnPump').onclick = () => postConfig({ stop_level: parseFloat(el.iStop.value), start_level: parseFloat(el.iStart.value) });
         document.getElementById('btnHw').onclick = () => postConfig({ tank_height: parseFloat(el.iH.value), max_dist: parseFloat(el.iM.value) });
         document.getElementById('btnTun').onclick = () => postConfig({
-            kp: parseFloat(el.iKp.value), ki: parseFloat(el.iKi.value), kd: parseFloat(el.iKd.value)
+            kp: parseFloat(el.iKp.value), ki: parseFloat(el.iKi.value), kd: parseFloat(el.iKd.value),
+            dac_offset_v: parseFloat(el.iOffset.value)
         });
     </script>
 </body>
@@ -446,7 +502,9 @@ def start_server(controller):
                 st = controller.config.copy()
                 st.update({
                     "level_percent": controller.level_percent,
-                    "valve_percent": controller.valve_percent
+                    "valve_percent": controller.valve_percent,
+                    "actuator_voltage": controller.actuator_voltage,
+                    "pump_on": controller.pump_on
                 })
                 resp = json.dumps(st)
             elif path == '/config' and method == 'POST':
